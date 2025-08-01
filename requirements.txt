@@ -1,0 +1,4 @@
+pytz
+openai
+python-telegram-bot
+requests
