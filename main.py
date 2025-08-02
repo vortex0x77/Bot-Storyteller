@@ -1481,7 +1481,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Приоритетную обработку
 • Новые темы и сюжеты
 
-📞 Поддержка: @support_username"""
+📞 Поддержка: @lkm325"""
     
     keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="start")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
