@@ -1,6 +1,10 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta, time
+import requests
+import uuid
+import logging
+from decimal import Decimal, InvalidOperation
 import logging
 import pytz
 from openai import OpenAI
@@ -19,6 +23,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ContextTypes, filters, JobQueue
 )
+from telegram.request import HTTPXRequest
 
 # ==================== Конфигурация ====================
 TELEGRAM_TOKEN = Config.TELEGRAM
@@ -30,19 +35,15 @@ YUKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 
 ADMIN_ID = Config.ADMIN_ID
 
-# Список тестеров (ID пользователей, которые могут бесплатно создавать сказки)
-TESTER_IDS = [
-    1968139479,
-    5952409238
-]
+TESTER_IDS = [1989214505, 1968139479]
 
 # Московская временная зона
 MSK_TZ = pytz.timezone('Europe/Moscow')
 
 TARIFFS = {
-    "week": {"price": 199, "stories": 10, "duration_days": 7},
-    "month": {"price": 399, "stories": 40, "duration_days": 30},
-    "year": {"price": 3990, "stories": 365, "duration_days": 365}
+    "week": {"price": 1, "stories": 10, "duration_days": 7},
+    "month": {"price": 1, "stories": 40, "duration_days": 30},
+    "year": {"price": 1, "stories": 365, "duration_days": 365}
 }
 FREE_LIMIT = 1
 
@@ -271,65 +272,155 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== ЮKassa API ====================
-def create_yukassa_payment(amount, description, user_id, tariff):
-    """Создание платежа через ЮKassa"""
+# ... keep existing imports and code above ...
+
+
+def normalize_phone(phone: str) -> str | None:
+    if not phone:
+        return None
+    # Убираем всё, кроме цифр
+    digits = ''.join(ch for ch in phone if ch.isdigit())
+    # Приведём к формату 79XXXXXXXXX
+    if digits.startswith('8') and len(digits) == 11:
+        digits = '7' + digits[1:]
+    if digits.startswith('7') and len(digits) == 11:
+        return digits
+    return None
+
+def get_user_contact(user_id):
     try:
-        # Генерируем уникальный идентификатор платежа
+        conn = sqlite3.connect("bot.db")
+        c = conn.cursor()
+        c.execute("SELECT email, phone FROM users WHERE id = ?", (user_id,))
+        result = c.fetchone()
+        conn.close()
+        if result:
+            return {"email": result[0], "phone": result[1]}
+    except Exception as e:
+        logger.error(f"get_user_contact error: {str(e)}")
+    return {"email": None, "phone": None}
+
+
+def normalize_phone_for_receipt(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    digits = re.sub(r"\D+", "", raw)
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) == 11 and digits.startswith("7"):
+        return digits
+    return None
+
+def save_user_contact(user_id: int, email: str | None = None, phone: str | None = None):
+    try:
+        conn = sqlite3.connect("bot.db")
+        c = conn.cursor()
+        if email:
+            c.execute("UPDATE users SET email = ? WHERE id = ?", (email.strip(), user_id))
+        if phone:
+            c.execute("UPDATE users SET phone = ? WHERE id = ?", (phone, user_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"Saved contact for user {user_id}: email={email}, phone={phone}")
+    except Exception as e:
+        logger.error(f"save_user_contact error: {e}")
+
+
+def create_yukassa_payment(amount, description, user_id, tariff, customer_email=None, customer_phone=None):
+        try:
+            amount_decimal = Decimal(str(amount))
+            value_str = f"{amount_decimal:.2f}"
+        except (InvalidOperation, ValueError, TypeError) as e:
+            logger.error(f"create_yukassa_payment: Неверный формат суммы '{amount}': {e}")
+            return None
+
+        # 2) Идемпотентность
         idempotence_key = str(uuid.uuid4())
-        
-        # Данные для создания платежа
+
+        # 3) Описание (ограничим 128 символов, как рекомендует YooKassa)
+        payment_description = description[:128] if description else f"Оплата тарифа {tariff}"
+
+        # 4) Подготовим customer (email/phone)
+        customer_block = {}
+        norm_phone = normalize_phone(customer_phone)
+        if customer_email:
+            customer_block["email"] = customer_email
+        if norm_phone:
+            customer_block["phone"] = norm_phone
+
+        receipt = {
+            "tax_system_code": getattr(Config, "TAX_SYSTEM_CODE", 1),
+            "items": [
+                {
+                    "description": payment_description,  # до 128 символов
+                    "quantity": "1.00",
+                    "amount": {"value": value_str, "currency": "RUB"},
+                    "vat_code": 6,  # 6 = без НДС (проверь для своего кейса!)
+                    "payment_mode": "full_payment",
+                    "payment_subject": "service"
+                }
+            ]
+        }
+        if customer_block:
+            receipt["customer"] = customer_block
+        else:
+            # Если нет email и телефона — при включённой фискализации будет 400.
+            logger.error("create_yukassa_payment: Отсутствует email/phone для чека, при включённой фискализации это вызовет ошибку.")
+            return None
+
+        # 5) Тело запроса
         payment_data = {
-            "amount": {
-                "value": str(amount),
-                "currency": "RUB"
-            },
+            "amount": {"value": value_str, "currency": "RUB"},
             "confirmation": {
                 "type": "redirect",
-                "return_url": f"https://t.me/fairytales_skazki_bot"  # Замените на ваш бот
+                "return_url": "https://t.me/fairytales_skazki_bot"
             },
             "capture": True,
-            "description": description,
+            "description": payment_description,
             "metadata": {
                 "user_id": str(user_id),
                 "tariff": tariff,
                 "bot_payment": "true"
-            }
+            },
+            "receipt": receipt
         }
-        
-        # Заголовки для запроса
+
         headers = {
             "Idempotence-Key": idempotence_key,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Accept": "application/json"
         }
-        
-        # Отправляем запрос к ЮKassa
+        auth = (YUKASSA_SHOP_ID, YUKASSA_SECRET_KEY)
+
+        logger.info(f"Создание платежа: user_id={user_id}, tariff={tariff}, amount={value_str} RUB.")
         response = requests.post(
             YUKASSA_API_URL,
             json=payment_data,
             headers=headers,
-            auth=(YUKASSA_SHOP_ID, YUKASSA_SECRET_KEY)
+            auth=auth,
+            timeout=20
         )
-        
-        if response.status_code == 200:
-            payment_info = response.json()
-            
-            # Сохраняем информацию о платеже в базу данных
-            save_payment_info(
-                payment_info["id"],
-                user_id,
-                tariff,
-                amount,
-                payment_info["status"]
-            )
-            
-            return payment_info
-        else:
-            logger.error(f"ЮKassa API error: {response.status_code} - {response.text}")
+
+        # 6) Успех = 200 или 201
+        if response.status_code in (200, 201):
+            try:
+                payment_info = response.json()
+                logger.info(f"Платеж создан: {payment_info.get('id')}, status={payment_info.get('status')}")
+                return payment_info
+            except ValueError as e:
+                logger.error(f"Не удалось разобрать JSON: {e}. Response text: {response.text}")
+
             return None
-            
-    except Exception as e:
-        logger.error(f"Error creating ЮKassa payment: {str(e)}")
-        return None
+        else:
+                    logger.error(f"Ошибка YooKassa {response.status_code}: {response.text}")
+                    # полезно вывести детали
+                    try:
+                        logger.error(f"Детали: {response.json()}")
+                    except Exception:
+                        pass
+                    return None
+
+
 
 def save_payment_info(payment_id, user_id, tariff, amount, status):
     """Сохранить информацию о платеже в базу данных"""
@@ -384,27 +475,38 @@ def update_payment_status(payment_id, status):
         logger.error(f"Error updating payment status: {str(e)}")
 
 def activate_subscription(user_id, tariff):
-    """Активировать подписку пользователя"""
+    """Активировать/продлить подписку и ПЛЮСОВАТЬ лимит сказок"""
     try:
         conn = sqlite3.connect("bot.db")
         c = conn.cursor()
-        
-        # Вычисляем дату окончания подписки
-        end_date = datetime.now() + timedelta(days=TARIFFS[tariff]["duration_days"])
-        
-        # Обновляем данные пользователя
-        c.execute("""UPDATE users 
-                     SET subscription = ?, subscription_end = ?, stories_used = 0, last_paid = ?
-                     WHERE id = ?""",
-                  (tariff, end_date.isoformat(), datetime.now().isoformat(), user_id))
-        
+
+        if tariff not in TARIFFS:
+            logger.error(f"activate_subscription: неизвестный тариф {tariff}")
+            conn.close()
+            return
+
+        add_stories = int(TARIFFS[tariff]["stories"])
+        duration_days = int(TARIFFS[tariff]["duration_days"])
+        new_end = datetime.now() + timedelta(days=duration_days)
+
+        # Получаем текущий лимит
+        c.execute("SELECT story_limit FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+        current_limit = int(row[0]) if row and row[0] is not None else 0
+        new_limit = current_limit + add_stories
+
+        # Обновляем подписку и лимит
+        c.execute("""
+            UPDATE users
+            SET subscription = ?, subscription_end = ?, last_paid = ?, story_limit = ?
+            WHERE id = ?
+        """, (tariff, new_end.isoformat(), datetime.now().isoformat(), new_limit, user_id))
+
         conn.commit()
         conn.close()
-        
-        logger.info(f"Subscription activated for user {user_id}: {tariff}")
-        
+        logger.info(f"Subscription updated for user {user_id}: +{add_stories} сказок")
     except Exception as e:
-        logger.error(f"Error activating subscription: {str(e)}")
+        logger.error(f"activate_subscription error: {str(e)}")
 
 # ==================== База данных ====================
 def ensure_column_exists(conn, table, column, coltype):
@@ -466,21 +568,22 @@ def init_db():
     c = conn.cursor()
     
     # Создание таблиц
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            name TEXT,
-            age INTEGER,
-            subscription TEXT,
-            subscription_end TEXT,
-            stories_used INTEGER DEFAULT 0,
-            last_paid TEXT,
-            timezone TEXT DEFAULT 'UTC',
-            is_blocked INTEGER DEFAULT 0,
-            is_tester INTEGER DEFAULT 0,
-            agreed_terms INTEGER DEFAULT 0  -- Столбец для согласия
-        )
-    """)
+    # Внутри функции init_db, в CREATE TABLE users
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        age INTEGER,
+        stories_used INTEGER DEFAULT 0,
+        is_blocked INTEGER DEFAULT 0,
+        is_tester INTEGER DEFAULT 0,
+        timezone TEXT DEFAULT 'UTC',
+        agreed_terms INTEGER DEFAULT 0,
+        email TEXT DEFAULT NULL,
+        phone TEXT DEFAULT NULL -- Добавлено поле phone
+    )""")
+    ensure_column_exists(conn, "users", "email", "TEXT")
+    ensure_column_exists(conn, "users", "story_limit", "INTEGER DEFAULT 0")
+    ensure_column_exists(conn, "users", "phone", "TEXT")
     
     c.execute("""
         CREATE TABLE IF NOT EXISTS stories (
@@ -532,7 +635,7 @@ def init_db():
     ensure_column_exists(conn, "users", "timezone", "TEXT DEFAULT 'UTC'")
     ensure_column_exists(conn, "users", "agreed_terms", "INTEGER DEFAULT 0")
     ensure_column_exists(conn, "stories", "created_at", "TEXT")
-    
+    ensure_column_exists(conn, "users", "story_limit", "INTEGER DEFAULT 0")
     # Исправляем NULL значения и неправильные типы данных
     try:
         c.execute("UPDATE users SET stories_used = 0 WHERE stories_used IS NULL OR stories_used = ''")
@@ -560,11 +663,18 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO prompts (role, content) VALUES (?, ?)", 
               ("final", "Создай финальную версию сказки с учётом всех улучшений."))
     
-    # Гарантируем, что админ есть и не заблокирован
-    c.execute("""INSERT OR REPLACE INTO users 
-                 (id, name, age, stories_used, is_blocked, is_tester, timezone, agreed_terms) 
-                 VALUES (?, ?, ?, 0, 0, 0, 'UTC', 1)""",
-              (ADMIN_ID, "Admin", 99))
+    # Гарантируем, что админ(ы) есть и не заблокирован(ы)
+    if isinstance(ADMIN_ID, (list, tuple, set)):
+        for admin_id in ADMIN_ID:
+            c.execute("""INSERT OR REPLACE INTO users 
+                         (id, name, age, stories_used, is_blocked, is_tester, timezone, agreed_terms) 
+                         VALUES (?, ?, ?, 0, 0, 0, 'UTC', 1)""",
+                      (int(admin_id), "Admin", 99))
+    else:
+        c.execute("""INSERT OR REPLACE INTO users 
+                     (id, name, age, stories_used, is_blocked, is_tester, timezone, agreed_terms) 
+                     VALUES (?, ?, ?, 0, 0, 0, 'UTC', 1)""",
+                  (int(ADMIN_ID), "Admin", 99))
     
     # Добавляем тестеров из списка
     for tester_id in TESTER_IDS:
@@ -1166,7 +1276,7 @@ def is_user_tester(user_id):
     return user.get('is_tester', 0) == 1
 
 def can_generate_story(user_id):
-    """Проверить, может ли пользователь создавать сказки"""
+    """Проверить, может ли пользователь создавать сказки (включая первую бесплатную)"""
     if is_user_blocked(user_id):
         return False, "Ваш аккаунт заблокирован"
     if not has_agreed_terms(user_id):
@@ -1177,25 +1287,23 @@ def can_generate_story(user_id):
         return False, "Пользователь не найден"
 
     try:
-        stories_used = int(user.get('stories_used', 0) or 0)
-    except (ValueError, TypeError):
+        stories_used = int(user.get("stories_used", 0) or 0)
+    except:
         stories_used = 0
 
-    subscription = user.get('subscription')
-    subscription_end = user.get('subscription_end')
+    try:
+        story_limit = int(user.get("story_limit", 0) or 0)
+    except:
+        story_limit = 0
 
-    if subscription and subscription_end:
-        try:
-            end_date = datetime.fromisoformat(subscription_end)
-            if datetime.now() < end_date:
-                tariff = TARIFFS.get(subscription)
-                if tariff and stories_used < tariff["stories"]:
-                    return True, f"Подписка активна ({tariff['stories'] - stories_used} сказок осталось)"
-        except Exception as e:
-            logger.warning(f"Error parsing subscription_end: {e}")
+    remaining = story_limit - stories_used
 
-    if stories_used < FREE_LIMIT:
-        return True, f"Бесплатный лимит ({FREE_LIMIT - stories_used} сказок осталось)"
+    # 🎁 Первая бесплатная сказка
+    if story_limit == 0 and stories_used == 0:
+        return True, "✨ Ваша первая сказка — бесплатно!"
+
+    if remaining > 0:
+        return True, f"Доступно {remaining} сказок"
 
     return False, "Лимит исчерпан. Нужна подписка"
 def update_user_stories_count(user_id):
@@ -1301,7 +1409,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Отправляем приветствие только для новых пользователей или обычных сообщений
     if not update.callback_query:
-        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+        if context.user_data.get("waiting_for") == "contact_for_receipt":
+            # Обработка номера телефона или email
+            text = (update.message.text or "").strip()
+            saved = False
+
+            phone = normalize_phone_for_receipt(text)
+            if phone:
+                save_user_contact(user_id, phone=phone)
+                await update.message.reply_text(f"✅ Телефон сохранён: {phone}")
+                saved = True
+            elif re.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", text):
+                save_user_contact(user_id, email=text)
+                await update.message.reply_text(f"✅ Email сохранён: {text}")
+                saved = True
+
+            if not saved:
+                await update.message.reply_text("❌ Не распознал контакт. Пришлите email или номер формата +7XXXXXXXXXX.")
+                return
+
+            context.user_data["waiting_for"] = None
+            await update.message.reply_text("Контакт сохранён ✅. Теперь можете оплатить:", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 К тарифам", callback_data="buy_subscription")]
+            ]))
+        else:
+            await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 # Для новых пользователей показываем соглашение
     if is_new and not update.callback_query:
@@ -1669,22 +1801,23 @@ async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Error parsing subscription_end: {e}")
             is_active = False
-    
-    if is_active and subscription in TARIFFS:
-        tariff = TARIFFS[subscription]
+
+        # активная подписка (is_active может быть True/False; ниже мы формируем текст для активной ветки)
         try:
-            remaining_stories = int(tariff.get("stories", 0)) - stories_used
+            story_limit = int(user.get("story_limit", 0) or 0)
         except (ValueError, TypeError):
-            remaining_stories = 0
-        
+            story_limit = 0
+
+        remaining_stories = max(0, story_limit - stories_used)
+
         text = f"""💎 Ваша подписка
 
 ✅ Статус: Активна
 📅 Тариф: {subscription.title()}
-⏰ До: {end_date.strftime('%d.%m.%Y %H:%M')}
 📚 Сказок осталось: {remaining_stories}
-📊 Использовано: {stories_used}"""
-        
+📊 Использовано: {stories_used} из {story_limit}
+"""
+
         keyboard = [
             [InlineKeyboardButton("📚 Создать сказку", callback_data="create_story")],
             [InlineKeyboardButton("💎 Продлить подписку", callback_data="buy_subscription")],
@@ -1759,7 +1892,6 @@ async def check_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🎉 Подписка активирована!\n"
                     f"📅 Тариф: {tariff.title()}\n"
                     f"📚 Доступно сказок: {tariff_info['stories']}\n"
-                    f"⏰ Действует: {tariff_info['duration_days']} дней\n\n"
                     f"Спасибо за покупку! Теперь вы можете создавать сказки.",
                     reply_markup=reply_markup
                 )
@@ -1819,7 +1951,7 @@ async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Приоритетную обработку
 • Доступ ко всем темам
 • Техническую поддержку
-
+            
 💳 Оплата через ЮKassa (банковские карты)"""
     
     keyboard = []
@@ -1849,36 +1981,46 @@ async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, reply_markup=reply_markup)
 
 async def process_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка платежа через ЮKassa"""
     query = update.callback_query
     await query.answer()
-    
+
     tariff = query.data.split("_")[1]
-    
     if tariff not in TARIFFS:
         await query.edit_message_text("❌ Неверный тариф")
         return
-    
+
     tariff_info = TARIFFS[tariff]
     price = tariff_info["price"]
     user_id = query.from_user.id
-    
-    # Создаем платеж в ЮKassa
     description = f"Подписка на сказки - {tariff} ({tariff_info['stories']} сказок на {tariff_info['duration_days']} дней)"
-    
-    payment_info = create_yukassa_payment(price, description, user_id, tariff)
-    
+
+    contact = get_user_contact(user_id)
+    email = (contact.get("email") or "").strip() or None
+    phone = normalize_phone_for_receipt(contact.get("phone"))
+
+    if not email and not phone:
+        # 1) Сохраним, что мы хотели купить, чтобы вернуться после ввода контакта
+        context.user_data["pending_payment"] = {"tariff": tariff, "price": price, "description": description}
+        context.user_data["waiting_for"] = "contact_for_receipt"
+
+        await query.edit_message_text(
+            "⚠️ Для отправки чека нужен email или номер телефона.\n"
+            "Пришлите email текстом или номер в формате +7XXXXXXXXXX/8XXXXXXXXXX.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="buy_subscription")]])
+        )
+        return
+
+    payment_info = create_yukassa_payment(price, description, user_id, tariff, customer_email=email, customer_phone=phone)
     if payment_info and payment_info.get("confirmation"):
         payment_url = payment_info["confirmation"]["confirmation_url"]
         payment_id = payment_info["id"]
-        
         keyboard = [
             [InlineKeyboardButton("💳 Оплатить", url=payment_url)],
             [InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment_{payment_id}")],
             [InlineKeyboardButton("🔙 Назад к тарифам", callback_data="buy_subscription")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
+
         await query.edit_message_text(
             f"💳 Ссылка для оплаты создана!\n\n"
             f"📦 Тариф: {tariff.title()}\n"
@@ -1891,7 +2033,7 @@ async def process_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         keyboard = [
-            [InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"pay_{tariff}")],
+            [InlineKeyboardButton("Попробовать снова", callback_data=f"pay_{tariff}")],
             [InlineKeyboardButton("🔙 Назад к тарифам", callback_data="buy_subscription")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3735,7 +3877,14 @@ def main():
     load_prices_from_db()
     
     # Создаем приложение
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Configure HTTPX client with higher read timeout than long-polling timeout to avoid ReadError
+    http_request = HTTPXRequest(
+        connect_timeout=10.0,
+        read_timeout=65.0,
+        write_timeout=10.0,
+        pool_timeout=10.0,
+    )
+    application = Application.builder().token(TELEGRAM_TOKEN).request(http_request).build()
     
     # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", start))
@@ -3750,10 +3899,10 @@ def main():
     
     # Запускаем бота
     logger.info("Bot started")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Align long-polling timeout with HTTP read timeout (must be lower than read_timeout)
+    application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=60)
 
 if __name__ == '__main__':
     main()
-
 
 
