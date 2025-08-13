@@ -636,6 +636,7 @@ def init_db():
     ensure_column_exists(conn, "users", "agreed_terms", "INTEGER DEFAULT 0")
     ensure_column_exists(conn, "stories", "created_at", "TEXT")
     ensure_column_exists(conn, "users", "story_limit", "INTEGER DEFAULT 0")
+    ensure_column_exists(conn, "users", "free_story_used", "INTEGER DEFAULT 0")
     # Исправляем NULL значения и неправильные типы данных
     try:
         c.execute("UPDATE users SET stories_used = 0 WHERE stories_used IS NULL OR stories_used = ''")
@@ -1298,26 +1299,41 @@ def can_generate_story(user_id):
 
     remaining = story_limit - stories_used
 
-    # 🎁 Первая бесплатная сказка
-    if story_limit == 0 and stories_used == 0:
-        return True, "✨ Ваша первая сказка — бесплатно!"
+    if is_user_tester(user_id):
+        return True, "Режим тестера: лимит не расходуется"
 
+# 🎁 Первая бесплатная сказка по флагу
+    if not int(user.get("free_story_used", 0) or 0):
+        return True, "✨ Ваша первая сказка — бесплатно!"
+    
     if remaining > 0:
         return True, f"Доступно {remaining} сказок"
 
     return False, "Лимит исчерпан. Нужна подписка"
 def update_user_stories_count(user_id):
-    """Увеличить счетчик использованных сказок"""
+    """Отметить бесплатную сказку или увеличить счетчик использованных"""
+    # Тестеры не тратят лимит; при этом не жжём бесплатную, чтобы не портить опыт
     if is_user_tester(user_id):
-        return  # Тестеры не тратят лимит
-    
+        return
+
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    
-    # Безопасно обновляем счетчик
-    c.execute("UPDATE users SET stories_used = COALESCE(stories_used, 0) + 1 WHERE id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    try:
+        c.execute("SELECT COALESCE(free_story_used, 0) FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+        free_used = int(row[0]) if row and row[0] is not None else 0
+
+        if free_used == 0:
+            # Первая сказка — ставим флаг, счётчик не трогаем
+            c.execute("UPDATE users SET free_story_used = 1 WHERE id = ?", (user_id,))
+        else:
+            # Дальше списываем из оплаченного лимита (через stories_used)
+            c.execute("UPDATE users SET stories_used = COALESCE(stories_used, 0) + 1 WHERE id = ?", (user_id,))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"update_user_stories_count error: {e}")
+    finally:
+        conn.close()
 
 def get_user_stats():
     """Получить статистику пользователей"""
@@ -1429,9 +1445,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             context.user_data["waiting_for"] = None
-            await update.message.reply_text("Контакт сохранён ✅. Теперь можете оплатить:", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 К тарифам", callback_data="buy_subscription")]
-            ]))
         else:
             await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
@@ -2081,7 +2094,6 @@ async def check_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🎉 Подписка активирована!\n"
                     f"📅 Тариф: {tariff.title()}\n"
                     f"📚 Доступно сказок: {tariff_info['stories']}\n"
-                    f"⏰ Действует: {tariff_info['duration_days']} дней\n\n"
                     f"Спасибо за покупку! Теперь вы можете создавать сказки.",
                     reply_markup=reply_markup
                 )
