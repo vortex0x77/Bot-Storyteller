@@ -1831,7 +1831,6 @@ async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Error parsing subscription_end: {e}")
             is_active = False
 
-        # активная подписка (is_active может быть True/False; ниже мы формируем текст для активной ветки)
         try:
             story_limit = int(user.get("story_limit", 0) or 0)
         except (ValueError, TypeError):
@@ -1844,7 +1843,8 @@ async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✅ Статус: Активна
 📅 Тариф: {subscription.title()}
 📚 Сказок осталось: {remaining_stories}
-📊 Использовано: {stories_used} из {story_limit}
+📈 Использовано: {stories_used} из {story_limit}
+⏰ Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}
 """
 
         keyboard = [
