@@ -41,9 +41,9 @@ TESTER_IDS = [1989214505, 1968139479]
 MSK_TZ = pytz.timezone('Europe/Moscow')
 
 TARIFFS = {
-    "week": {"price": 1, "stories": 10, "duration_days": 7},
-    "month": {"price": 1, "stories": 40, "duration_days": 30},
-    "year": {"price": 1, "stories": 365, "duration_days": 365}
+    "week": {"price": 119, "stories": 10, "duration_days": 7},
+    "month": {"price": 339, "stories": 40, "duration_days": 30},
+    "year": {"price": 3990, "stories": 365, "duration_days": 365}
 }
 FREE_LIMIT = 1
 
@@ -1277,62 +1277,78 @@ def is_user_tester(user_id):
     return user.get('is_tester', 0) == 1
 
 def can_generate_story(user_id):
-    """Проверить, может ли пользователь создавать сказки (включая первую бесплатную)"""
+    """Проверить, может ли пользователь создавать сказки (1 бесплатная, затем из лимита)"""
+    # Блокировка и согласие с условиями
     if is_user_blocked(user_id):
         return False, "Ваш аккаунт заблокирован"
     if not has_agreed_terms(user_id):
         return False, "Пожалуйста, пройдите согласие с условиями"
 
+    # Тестеры всегда могут генерировать и не тратят лимит
+    if is_user_tester(user_id):
+        return True, "Режим тестера: лимит не расходуется"
+
     user = get_user(user_id)
     if not user:
         return False, "Пользователь не найден"
 
+    # Безопасно читаем значения
+    try:
+        free_story_used = int(user.get("free_story_used", 0) or 0)
+    except Exception:
+        free_story_used = 0
+
     try:
         stories_used = int(user.get("stories_used", 0) or 0)
-    except:
+    except Exception:
         stories_used = 0
 
     try:
         story_limit = int(user.get("story_limit", 0) or 0)
-    except:
+    except Exception:
         story_limit = 0
 
-    remaining = story_limit - stories_used
-
-    if is_user_tester(user_id):
-        return True, "Режим тестера: лимит не расходуется"
-
-# 🎁 Первая бесплатная сказка по флагу
-    if not int(user.get("free_story_used", 0) or 0):
+    # 1) Если бесплатная ещё не использована — разрешаем бесплатно
+    if free_story_used == 0:
         return True, "✨ Ваша первая сказка — бесплатно!"
-    
+
+    # 2) Иначе смотрим платный лимит
+    remaining = max(0, story_limit - stories_used)
     if remaining > 0:
         return True, f"Доступно {remaining} сказок"
 
+    # 3) Лимит исчерпан
     return False, "Лимит исчерпан. Нужна подписка"
 def update_user_stories_count(user_id):
-    """Отметить бесплатную сказку или увеличить счетчик использованных"""
-    # Тестеры не тратят лимит; при этом не жжём бесплатную, чтобы не портить опыт
     if is_user_tester(user_id):
         return
 
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
     try:
-        c.execute("SELECT COALESCE(free_story_used, 0) FROM users WHERE id = ?", (user_id,))
-        row = c.fetchone()
-        free_used = int(row[0]) if row and row[0] is not None else 0
+        c.execute("""
+            SELECT COALESCE(free_story_used, 0),
+                   COALESCE(story_limit, 0),
+                   COALESCE(stories_used, 0)
+            FROM users
+            WHERE id = ?
+        """, (user_id,))
+        free_used, story_limit, stories_used = c.fetchone()
 
         if free_used == 0:
-            # Первая сказка — ставим флаг, счётчик не трогаем
+            # первая бесплатная
             c.execute("UPDATE users SET free_story_used = 1 WHERE id = ?", (user_id,))
         else:
-            # Дальше списываем из оплаченного лимита (через stories_used)
-            c.execute("UPDATE users SET stories_used = COALESCE(stories_used, 0) + 1 WHERE id = ?", (user_id,))
-        conn.commit()
+            if stories_used < story_limit:
+                c.execute("""
+                    UPDATE users
+                    SET stories_used = COALESCE(stories_used, 0) + 1
+                    WHERE id = ?
+                """, (user_id,))
     except Exception as e:
         logger.error(f"update_user_stories_count error: {e}")
     finally:
+        conn.commit()
         conn.close()
 
 def get_user_stats():
