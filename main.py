@@ -42,10 +42,11 @@ MSK_TZ = pytz.timezone('Europe/Moscow')
 
 TARIFFS = {
     "week": {"price": 119, "stories": 10, "duration_days": 7},
-    "month": {"price": 339, "stories": 40, "duration_days": 30},
-    "year": {"price": 3990, "stories": 365, "duration_days": 365}
+    "month": {"price": 399, "stories": -1, "duration_days": 30},  # -1 означает безлимит
+    "year": {"price": 3990, "stories": -1, "duration_days": 365}  # -1 означает безлимит
 }
 FREE_LIMIT = 1
+DAILY_LIMIT = 30  # Максимум сказок в день для защиты от скликеров
 
 MORALS = [
     "Дружба важнее всего",
@@ -485,15 +486,20 @@ def activate_subscription(user_id, tariff):
             conn.close()
             return
 
-        add_stories = int(TARIFFS[tariff]["stories"])
-        duration_days = int(TARIFFS[tariff]["duration_days"])
+        add_stories = TARIFFS[tariff]["stories"]
+        duration_days = TARIFFS[tariff]["duration_days"]
         new_end = datetime.now() + timedelta(days=duration_days)
 
         # Получаем текущий лимит
         c.execute("SELECT story_limit FROM users WHERE id = ?", (user_id,))
         row = c.fetchone()
         current_limit = int(row[0]) if row and row[0] is not None else 0
-        new_limit = current_limit + add_stories
+
+        # Для безлимитных тарифов устанавливаем story_limit = -1
+        if add_stories == -1:
+            new_limit = -1
+        else:
+            new_limit = current_limit + add_stories
 
         # Обновляем подписку и лимит
         c.execute("""
@@ -504,7 +510,7 @@ def activate_subscription(user_id, tariff):
 
         conn.commit()
         conn.close()
-        logger.info(f"Subscription updated for user {user_id}: +{add_stories} сказок")
+        logger.info(f"Subscription updated for user {user_id}: new limit {new_limit}")
     except Exception as e:
         logger.error(f"activate_subscription error: {str(e)}")
 
@@ -584,6 +590,9 @@ def init_db():
     ensure_column_exists(conn, "users", "email", "TEXT")
     ensure_column_exists(conn, "users", "story_limit", "INTEGER DEFAULT 0")
     ensure_column_exists(conn, "users", "phone", "TEXT")
+    ensure_column_exists(conn, "users", "free_story_used", "INTEGER DEFAULT 0")
+    ensure_column_exists(conn, "users", "daily_stories_used", "INTEGER DEFAULT 0")
+    ensure_column_exists(conn, "users", "last_story_date", "TEXT")
     
     c.execute("""
         CREATE TABLE IF NOT EXISTS stories (
@@ -637,6 +646,8 @@ def init_db():
     ensure_column_exists(conn, "stories", "created_at", "TEXT")
     ensure_column_exists(conn, "users", "story_limit", "INTEGER DEFAULT 0")
     ensure_column_exists(conn, "users", "free_story_used", "INTEGER DEFAULT 0")
+    ensure_column_exists(conn, "users", "daily_stories_used", "INTEGER DEFAULT 0")
+    ensure_column_exists(conn, "users", "last_story_date", "TEXT")
     # Исправляем NULL значения и неправильные типы данных
     try:
         c.execute("UPDATE users SET stories_used = 0 WHERE stories_used IS NULL OR stories_used = ''")
@@ -934,6 +945,24 @@ async def generate_story_with_custom_prompts(update: Update, context: ContextTyp
             await query.edit_message_text("❌ Не хватает данных для создания сказки")
         except:
             pass
+        return
+    
+    # Проверяем дневной лимит и подписку
+    can, info = can_generate_story(user_id)
+    if not can:
+        if info == "daily_limit_reached":
+            limit_message = """🎉 Поздравляем! Сегодня вы достигли максимума — 30 сказок.
+
+Это наш защитный предел, чтобы сервис работал стабильно.
+
+Завтра сказки снова будут ждать вас 💫"""
+            keyboard = [[InlineKeyboardButton("🏠 Главное меню", callback_data="start")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(limit_message, reply_markup=reply_markup)
+        else:
+            keyboard = [[InlineKeyboardButton("💎 Подписка", callback_data="subscription")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(f"❌ {info}", reply_markup=reply_markup)
         return
     
     # Показываем сообщение о генерации
@@ -1277,7 +1306,7 @@ def is_user_tester(user_id):
     return user.get('is_tester', 0) == 1
 
 def can_generate_story(user_id):
-    """Проверить, может ли пользователь создавать сказки (1 бесплатная, затем из лимита)"""
+    """Проверить, может ли пользователь создавать сказки с учетом дневного лимита"""
     # Блокировка и согласие с условиями
     if is_user_blocked(user_id):
         return False, "Ваш аккаунт заблокирован"
@@ -1291,6 +1320,11 @@ def can_generate_story(user_id):
     user = get_user(user_id)
     if not user:
         return False, "Пользователь не найден"
+
+    # Проверяем дневной лимит для всех пользователей
+    daily_used = check_daily_limit(user_id)
+    if daily_used >= DAILY_LIMIT:
+        return False, "daily_limit_reached"
 
     # Безопасно читаем значения
     try:
@@ -1308,17 +1342,97 @@ def can_generate_story(user_id):
     except Exception:
         story_limit = 0
 
+    # Проверяем активную подписку
+    subscription = user.get('subscription')
+    subscription_end = user.get('subscription_end')
+    has_active_subscription = False
+    
+    if subscription and subscription_end:
+        try:
+            end_date = datetime.fromisoformat(subscription_end)
+            has_active_subscription = datetime.now() < end_date
+        except Exception:
+            has_active_subscription = False
+
     # 1) Если бесплатная ещё не использована — разрешаем бесплатно
     if free_story_used == 0:
         return True, "✨ Ваша первая сказка — бесплатно!"
 
-    # 2) Иначе смотрим платный лимит
+    # 2) Если есть активная подписка на месяц или год (безлимит) - разрешаем
+    if has_active_subscription and subscription in ['month', 'year']:
+        return True, f"Безлимит сказок (осталось сегодня: {DAILY_LIMIT - daily_used})"
+
+    # 3) Иначе смотрим платный лимит (для недельной подписки)
     remaining = max(0, story_limit - stories_used)
     if remaining > 0:
         return True, f"Доступно {remaining} сказок"
 
-    # 3) Лимит исчерпан
+    # 4) Лимит исчерпан
     return False, "Лимит исчерпан. Нужна подписка"
+def check_daily_limit(user_id):
+    """Проверить количество сказок, созданных сегодня"""
+    if is_user_tester(user_id):
+        return 0  # Тестеры не имеют дневного лимита
+    
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    try:
+        today = datetime.now().date().isoformat()
+        
+        # Получаем данные пользователя
+        c.execute("""
+            SELECT COALESCE(daily_stories_used, 0), last_story_date
+            FROM users WHERE id = ?
+        """, (user_id,))
+        result = c.fetchone()
+        
+        if not result:
+            return 0
+        
+        daily_used, last_date = result
+        
+        # Если дата не совпадает с сегодняшней, сбрасываем счетчик
+        if last_date != today:
+            c.execute("""
+                UPDATE users 
+                SET daily_stories_used = 0, last_story_date = ?
+                WHERE id = ?
+            """, (today, user_id))
+            conn.commit()
+            return 0
+        
+        return int(daily_used or 0)
+        
+    except Exception as e:
+        logger.error(f"check_daily_limit error: {e}")
+        return 0
+    finally:
+        conn.close()
+
+def update_daily_counter(user_id):
+    """Увеличить дневной счетчик сказ��к"""
+    if is_user_tester(user_id):
+        return  # Тестеры не тратят дневной лимит
+    
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    try:
+        today = datetime.now().date().isoformat()
+        
+        # Обновляем дневной счетчик
+        c.execute("""
+            UPDATE users 
+            SET daily_stories_used = COALESCE(daily_stories_used, 0) + 1,
+                last_story_date = ?
+            WHERE id = ?
+        """, (today, user_id))
+        conn.commit()
+        
+    except Exception as e:
+        logger.error(f"update_daily_counter error: {e}")
+    finally:
+        conn.close()
+
 def update_user_stories_count(user_id):
     if is_user_tester(user_id):
         return
@@ -1333,13 +1447,34 @@ def update_user_stories_count(user_id):
             FROM users
             WHERE id = ?
         """, (user_id,))
-        free_used, story_limit, stories_used = c.fetchone()
+        result = c.fetchone()
+        if not result:
+            return
+            
+        free_used, story_limit, stories_used = result
+
+        # Обновляем дневной счетчик
+        update_daily_counter(user_id)
 
         if free_used == 0:
             # первая бесплатная
             c.execute("UPDATE users SET free_story_used = 1 WHERE id = ?", (user_id,))
         else:
-            if stories_used < story_limit:
+            # Для безлимитных тарифов (месяц/год) не увеличиваем stories_used
+            user = get_user(user_id)
+            subscription = user.get('subscription') if user else None
+            subscription_end = user.get('subscription_end') if user else None
+            
+            has_unlimited = False
+            if subscription and subscription_end:
+                try:
+                    end_date = datetime.fromisoformat(subscription_end)
+                    has_unlimited = (datetime.now() < end_date and subscription in ['month', 'year'])
+                except Exception:
+                    has_unlimited = False
+            
+            # Только для недельной подписки увеличиваем счетчик
+            if not has_unlimited and stories_used < story_limit:
                 c.execute("""
                     UPDATE users
                     SET stories_used = COALESCE(stories_used, 0) + 1
@@ -1854,15 +1989,21 @@ async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (ValueError, TypeError):
             story_limit = 0
 
-        remaining_stories = max(0, story_limit - stories_used)
+        if story_limit == -1:
+            remaining_line = "📚 Сказок: Безлимит"
+            used_line = ""
+        else:
+            remaining_stories = max(0, story_limit - stories_used)
+            remaining_line = f"📚 Сказок осталось: {remaining_stories}"
+            used_line = f"📈 Использовано: {stories_used} из {story_limit}\n"
 
         text = f"""💎 Ваша подписка
 
 ✅ Статус: Активна
 📅 Тариф: {subscription.title()}
-📚 Сказок осталось: {remaining_stories}
-📈 Использовано: {stories_used} из {story_limit}
-⏰ Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}
+{remaining_line}
+{used_line}⏰ Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}
+📅 Дневной лимит: {DAILY_LIMIT - check_daily_limit(user_id)} из {DAILY_LIMIT}
 """
 
         keyboard = [
@@ -1871,7 +2012,7 @@ async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔙 Назад", callback_data="start")]
         ]
     else:
-        remaining_free = max(0, FREE_LIMIT - stories_used)
+        remaining_free = 1 if user.get('free_story_used', 0) == 0 else 0
         text = f"""💎 Подписка
 
 ❌ Статус: Не активна
@@ -1881,7 +2022,7 @@ async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Больше сказок в месяц
 • Приоритетная обработка
 • Новые темы и сюжеты
-• Персонализация историй"""
+• Перс��нализация историй"""
         
         keyboard = [
             [InlineKeyboardButton("💎 Оформить подписку", callback_data="buy_subscription")],
@@ -2006,16 +2147,20 @@ async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = tariff_info["price"]
         stories = tariff_info["stories"]
         days = tariff_info["duration_days"]
-        
+
+        # Измените эту часть:
         if tariff_key == "week":
             tariff_name = f"📅 Неделя - {price}₽"
+            # Для недели показываем количество сказок
             description = f"{stories} сказок на {days} дней"
         elif tariff_key == "month":
             tariff_name = f"📅 Месяц - {price}₽"
-            description = f"{stories} сказок на {days} дней"
-        else:  # year
+            # Для месяца показываем "безлимит"
+            description = f"безлимит сказок на {days} дней"
+        else: # year
             tariff_name = f"📅 Год - {price}₽"
-            description = f"{stories} сказок на {days} дней"
+            # Для года показываем "безлимит"
+            description = f"безлимит сказок на {days} дней"
         
         keyboard.append([InlineKeyboardButton(
             f"{tariff_name} - {description}", 
@@ -2039,7 +2184,8 @@ async def process_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tariff_info = TARIFFS[tariff]
     price = tariff_info["price"]
     user_id = query.from_user.id
-    description = f"Подписка на сказки - {tariff} ({tariff_info['stories']} сказок на {tariff_info['duration_days']} дней)"
+    stories_desc = "безлимит сказок" if tariff_info["stories"] == -1 else f"{tariff_info['stories']} сказок"
+    description = f"Подписка на сказки - {tariff} ({stories_desc} на {tariff_info['duration_days']} дней)"
 
     contact = get_user_contact(user_id)
     email = (contact.get("email") or "").strip() or None
