@@ -1482,25 +1482,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать главное меню"""
     user_id = update.effective_user.id
+    user = get_user(user_id)  # берём данные из БД
+    
     keyboard = [
         [InlineKeyboardButton("📚 Создать сказку", callback_data="create_story")],
         [InlineKeyboardButton("📖 Мои сказки", callback_data="my_stories")],
         [InlineKeyboardButton("💎 Подписка", callback_data="subscription")],
         [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")]
     ]
+    
+    # Добавляем кнопку согласия только если пользователь ещё не согласился
+    if not user or not user.get("agreed_terms"):
+        keyboard.append([InlineKeyboardButton("✅ Согласие с условиями", callback_data="agree_terms")])
+    
     if user_id == ADMIN_ID:
         keyboard.append([InlineKeyboardButton("🔧 Админ панель", callback_data="admin_back")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
     
+    reply_markup = InlineKeyboardMarkup(keyboard)
     text = "Выберите действие:"
     
-    # Проверяем, вызвана ли функция из callback query или из обычного сообщения
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
     else:
         await update.message.reply_text(text, reply_markup=reply_markup)
 
+async def agree_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение согласия с условиями"""
+    user_id = update.effective_user.id
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("UPDATE users SET agreed_terms = 1 WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
 
+    await update.callback_query.answer("✅ Согласие принято")
+    await update.callback_query.edit_message_text(
+        "Спасибо! Теперь вы можете пользоваться ботом без ограничений 🎉"
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда помощи"""
@@ -3921,6 +3939,7 @@ def main():
     
     # Добавляем обработчики callback-запросов
     application.add_handler(CallbackQueryHandler(handle_callback_query))
+    application.add_handler(CallbackQueryHandler(agree_terms, pattern="^agree_terms$"))
     
     # Добавляем обработчик текстовых сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
